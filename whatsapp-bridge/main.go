@@ -1316,6 +1316,18 @@ func extractMediaInfo(msg *waProto.Message, msgTimestamp time.Time, msgID string
 		return "", "", "", nil, nil, nil, 0
 	}
 
+	// Self-sent messages synced from the user's own phone arrive wrapped — unwrap
+	// the common envelopes first, or documents lose their download keys.
+	if dsm := msg.GetDeviceSentMessage(); dsm != nil && dsm.GetMessage() != nil {
+		msg = dsm.GetMessage()
+	}
+	if dwc := msg.GetDocumentWithCaptionMessage(); dwc != nil && dwc.GetMessage() != nil {
+		msg = dwc.GetMessage()
+	}
+	if vo := msg.GetViewOnceMessage(); vo != nil && vo.GetMessage() != nil {
+		msg = vo.GetMessage()
+	}
+
 	// Use message timestamp for filename, fallback to current time if zero
 	ts := msgTimestamp
 	if ts.IsZero() {
@@ -2126,6 +2138,62 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 				"message": fmt.Sprintf("Typing indicator set to %v", req.IsTyping),
 			})
 		}
+	}))
+
+	// Kimi Jimmy: create a group (creator is added implicitly by WhatsApp).
+	mux.HandleFunc("/api/create-group", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Name) == "" {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+		name := strings.TrimSpace(req.Name)
+		if len(name) > 25 {
+			name = name[:25]
+		}
+		info, err := client.CreateGroup(r.Context(), whatsmeow.ReqCreateGroup{Name: name})
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "jid": info.JID.String(), "name": name})
+	}))
+
+	// Kimi Jimmy: invite link for a group (for adding collaborators).
+	mux.HandleFunc("/api/invite-link", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			JID string `json:"jid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.JID == "" {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+		gjid, err := types.ParseJID(req.JID)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "bad jid"})
+			return
+		}
+		link, err := client.GetGroupInviteLink(r.Context(), gjid, false)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "link": link})
 	}))
 
 	return mux
