@@ -125,6 +125,15 @@ func NewMessageStore() (*MessageStore, error) {
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
 
+		-- IDs of messages sent through THIS bridge's REST API (app + MCP tools).
+		-- Phone-sent and bridge-sent messages are otherwise indistinguishable
+		-- (same account, same sender) — pollers join against this to skip echoes
+		-- of their own programmatic sends.
+		CREATE TABLE IF NOT EXISTS bridge_sent (
+			id TEXT PRIMARY KEY,
+			ts TIMESTAMP
+		);
+
 		CREATE TABLE IF NOT EXISTS calls (
 			call_id TEXT,
 			chat_jid TEXT,
@@ -1260,6 +1269,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			mediaType, filename, "", nil, nil, nil, 0, quotedMsgID,
 		); storeErr != nil {
 			fmt.Printf("Warning: failed to persist outbound message: %v\n", storeErr)
+		}
+		// mark as bridge-originated so pollers can tell it apart from the phone
+		if _, sentErr := messageStore.db.Exec(
+			"INSERT OR IGNORE INTO bridge_sent (id, ts) VALUES (?, ?)", resp.ID, timestamp,
+		); sentErr != nil {
+			fmt.Printf("Warning: failed to mark bridge_sent: %v\n", sentErr)
 		}
 	}
 
