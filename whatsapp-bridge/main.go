@@ -2009,6 +2009,10 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			return
 		}
 		pollMsg := client.BuildPollCreation(req.Question, req.Options, req.Selectable)
+		// current phone clients render polls sent as V3 — a V1 PollCreationMessage
+		// is accepted by the server but shows NOTHING in the chat
+		pollMsg.PollCreationMessageV3 = pollMsg.PollCreationMessage
+		pollMsg.PollCreationMessage = nil
 		resp, err := client.SendMessage(context.Background(), recipientJID, pollMsg)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
