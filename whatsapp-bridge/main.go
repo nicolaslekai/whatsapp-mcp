@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
@@ -132,6 +133,23 @@ func NewMessageStore() (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS bridge_sent (
 			id TEXT PRIMARY KEY,
 			ts TIMESTAMP
+		);
+
+		-- Polls sent via /api/send-poll. Vote updates arrive E2E-encrypted and
+		-- carry only SHA256 hashes of the chosen option text — we keep the
+		-- option list to map a hash back to its 1-based index.
+		CREATE TABLE IF NOT EXISTS polls (
+			id TEXT PRIMARY KEY,
+			chat_jid TEXT,
+			question TEXT,
+			options TEXT,
+			ts TIMESTAMP
+		);
+		CREATE TABLE IF NOT EXISTS poll_votes (
+			poll_id TEXT,
+			voter TEXT,
+			digit INTEGER,
+			PRIMARY KEY (poll_id, voter)
 		);
 
 		CREATE TABLE IF NOT EXISTS calls (
@@ -1460,6 +1478,64 @@ func senderAltForMessage(client *whatsmeow.Client, info types.MessageInfo) types
 }
 
 // Handle regular incoming messages with media support
+// A poll vote arrives as an encrypted PollUpdateMessage carrying SHA256 hashes of
+// the chosen option text. Decrypt it, map the hash back to the option's 1-based
+// index, and store that digit as a synthetic message row — downstream pollers then
+// treat a poll tap exactly like a typed "2".
+func handlePollVote(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, chatJID, sender string, logger waLog.Logger) {
+	pum := msg.Message.GetPollUpdateMessage()
+	pollID := pum.GetPollCreationMessageKey().GetID()
+	var optJSON string
+	if err := messageStore.db.QueryRow("SELECT options FROM polls WHERE id = ?", pollID).Scan(&optJSON); err != nil {
+		logger.Infof("Poll vote for unknown poll %s — ignoring", pollID)
+		return
+	}
+	var options []string
+	if err := json.Unmarshal([]byte(optJSON), &options); err != nil {
+		return
+	}
+	vote, err := client.DecryptPollVote(context.Background(), msg)
+	if err != nil {
+		logger.Warnf("Poll vote decrypt failed: %v", err)
+		return
+	}
+	sel := vote.GetSelectedOptions()
+	if len(sel) == 0 {
+		return // vote retracted — nothing to inject
+	}
+	digit := 0
+	for i, opt := range options {
+		h := sha256.Sum256([]byte(opt))
+		if bytes.Equal(h[:], sel[0]) {
+			digit = i + 1
+			break
+		}
+	}
+	if digit == 0 {
+		logger.Warnf("Poll vote hash matched no stored option (poll %s)", pollID)
+		return
+	}
+	var prev int
+	_ = messageStore.db.QueryRow("SELECT digit FROM poll_votes WHERE poll_id = ? AND voter = ?", pollID, sender).Scan(&prev)
+	if prev == digit {
+		return // same voter tapping the same option again
+	}
+	if _, err := messageStore.db.Exec("INSERT OR REPLACE INTO poll_votes (poll_id, voter, digit) VALUES (?, ?, ?)", pollID, sender, digit); err != nil {
+		logger.Warnf("Failed to store poll vote: %v", err)
+	}
+	if err := messageStore.StoreChat(chatJID, "", msg.Info.Timestamp); err != nil {
+		logger.Warnf("Failed to store chat for poll vote: %v", err)
+	}
+	if err := messageStore.StoreMessage(
+		msg.Info.ID, chatJID, sender, fmt.Sprintf("%d", digit), msg.Info.Timestamp,
+		msg.Info.IsFromMe, "", "", "", nil, nil, nil, 0, "",
+	); err != nil {
+		logger.Warnf("Failed to store poll vote row: %v", err)
+		return
+	}
+	logger.Infof("Poll vote: %s chose option %d in %s", sender, digit, chatJID)
+}
+
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Resolve LID-based chats to phone-based JIDs so that incoming
 	// and outgoing messages land in the same chat entry.
@@ -1471,6 +1547,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// the LID store has a mapping.
 	resolvedSender := resolveUserJID(client, msg.Info.Sender, senderAltForMessage(client, msg.Info))
 	sender := resolvedSender.User
+
+	// Poll taps carry no text and would otherwise be dropped as empty messages.
+	if msg.Message.GetPollUpdateMessage() != nil {
+		handlePollVote(client, messageStore, msg, chatJID, sender, logger)
+		return
+	}
 
 	// Get appropriate chat name (pass resolved JID so contact lookup works)
 	name := GetChatName(client, messageStore, resolvedChat, chatJID, nil, sender, logger)
@@ -1893,6 +1975,64 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 		_ = json.NewEncoder(w).Encode(status)
+	}))
+
+	// Native WhatsApp poll — the nicest UI for a numbered decision. Votes come
+	// back through handlePollVote as synthetic digit rows, so the app's existing
+	// decision routing works unchanged whether the user taps the poll or types "2".
+	mux.HandleFunc("/api/send-poll", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Recipient  string   `json:"recipient"`
+			Question   string   `json:"question"`
+			Options    []string `json:"options"`
+			Selectable int      `json:"selectable"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" || req.Question == "" || len(req.Options) < 2 || len(req.Options) > 12 {
+			http.Error(w, "Need recipient, question and 2-12 options", http.StatusBadRequest)
+			return
+		}
+		if req.Selectable < 1 {
+			req.Selectable = 1
+		}
+		recipientJID, err := resolveRecipientJID(client, req.Recipient)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Invalid recipient: %v", err)})
+			return
+		}
+		pollMsg := client.BuildPollCreation(req.Question, req.Options, req.Selectable)
+		resp, err := client.SendMessage(context.Background(), recipientJID, pollMsg)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Error sending poll: %v", err)})
+			return
+		}
+		optJSON, _ := json.Marshal(req.Options)
+		if messageStore != nil {
+			if _, err := messageStore.db.Exec("INSERT OR REPLACE INTO polls (id, chat_jid, question, options, ts) VALUES (?, ?, ?, ?, ?)",
+				resp.ID, recipientJID.String(), req.Question, string(optJSON), resp.Timestamp); err != nil {
+				fmt.Printf("Warning: failed to store poll: %v\n", err)
+			}
+			if _, err := messageStore.db.Exec("INSERT OR IGNORE INTO bridge_sent (id, ts) VALUES (?, ?)", resp.ID, resp.Timestamp); err != nil {
+				fmt.Printf("Warning: failed to mark poll bridge_sent: %v\n", err)
+			}
+			// visible history row so list_messages shows the poll happened
+			if client.Store != nil && client.Store.ID != nil {
+				_ = messageStore.StoreChat(recipientJID.String(), "", resp.Timestamp)
+				_ = messageStore.StoreMessage(resp.ID, recipientJID.String(), client.Store.ID.User,
+					"📊 "+req.Question, resp.Timestamp, true, "", "", "", nil, nil, nil, 0, "")
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Poll sent", "message_id": resp.ID})
 	}))
 
 	// Handler for sending messages
