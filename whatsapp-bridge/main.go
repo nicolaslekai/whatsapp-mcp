@@ -196,6 +196,12 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 	if err := ensureColumn(db, "messages", "quoted_message_id", "TEXT"); err != nil {
 		return fmt.Errorf("failed to ensure messages.quoted_message_id column: %w", err)
 	}
+	// A multi-select poll returns a SET of options, which no longer fits the old
+	// single-value digit column. Added alongside it rather than replacing it — the old
+	// column keeps already-answered polls readable and costs nothing.
+	if err := ensureColumn(db, "poll_votes", "digits", "TEXT"); err != nil {
+		return fmt.Errorf("failed to ensure poll_votes.digits column: %w", err)
+	}
 	return nil
 }
 
@@ -1503,37 +1509,46 @@ func handlePollVote(client *whatsmeow.Client, messageStore *MessageStore, msg *e
 	if len(sel) == 0 {
 		return // vote retracted — nothing to inject
 	}
-	digit := 0
+	// sel carries the voter's COMPLETE current selection, not just the option they last
+	// tapped — so map every hash, not sel[0]. Reading only the first one made a second
+	// tap look identical to the first and dropped it silently: multi-select never worked.
+	// Walking options in order keeps the digits ascending, no sort needed.
+	var picks []string
 	for i, opt := range options {
 		h := sha256.Sum256([]byte(opt))
-		if bytes.Equal(h[:], sel[0]) {
-			digit = i + 1
-			break
+		for _, s := range sel {
+			if bytes.Equal(h[:], s) {
+				picks = append(picks, strconv.Itoa(i+1))
+				break
+			}
 		}
 	}
-	if digit == 0 {
+	if len(picks) == 0 {
 		logger.Warnf("Poll vote hash matched no stored option (poll %s)", pollID)
 		return
 	}
-	var prev int
-	_ = messageStore.db.QueryRow("SELECT digit FROM poll_votes WHERE poll_id = ? AND voter = ?", pollID, sender).Scan(&prev)
-	if prev == digit {
-		return // same voter tapping the same option again
+	digits := strings.Join(picks, ",")
+	var prev sql.NullString
+	_ = messageStore.db.QueryRow("SELECT digits FROM poll_votes WHERE poll_id = ? AND voter = ?", pollID, sender).Scan(&prev)
+	if prev.Valid && prev.String == digits {
+		return // same voter, same selection — nothing changed
 	}
-	if _, err := messageStore.db.Exec("INSERT OR REPLACE INTO poll_votes (poll_id, voter, digit) VALUES (?, ?, ?)", pollID, sender, digit); err != nil {
+	if _, err := messageStore.db.Exec("INSERT OR REPLACE INTO poll_votes (poll_id, voter, digits) VALUES (?, ?, ?)", pollID, sender, digits); err != nil {
 		logger.Warnf("Failed to store poll vote: %v", err)
 	}
 	if err := messageStore.StoreChat(chatJID, "", msg.Info.Timestamp); err != nil {
 		logger.Warnf("Failed to store chat for poll vote: %v", err)
 	}
+	// each tap writes its own row, so the app sees the selection grow ("1", then "1,3")
+	// and decides for itself when the answer is final
 	if err := messageStore.StoreMessage(
-		msg.Info.ID, chatJID, sender, fmt.Sprintf("%d", digit), msg.Info.Timestamp,
+		msg.Info.ID, chatJID, sender, digits, msg.Info.Timestamp,
 		msg.Info.IsFromMe, "", "", "", nil, nil, nil, 0, "",
 	); err != nil {
 		logger.Warnf("Failed to store poll vote row: %v", err)
 		return
 	}
-	logger.Infof("Poll vote: %s chose option %d in %s", sender, digit, chatJID)
+	logger.Infof("Poll vote: %s chose option(s) %s in %s", sender, digits, chatJID)
 }
 
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
@@ -2620,6 +2635,19 @@ func main() {
 				}
 				time.Sleep(5 * time.Second)
 				continue
+			}
+
+			// Second pairing path: an 8-character code typed into the phone instead of a
+			// QR scan. The camera app cannot scan our terminal QR ("link couldn't be
+			// opened") and a code lives minutes, not seconds. PAIR_PHONE=4917… ./bridge
+			if phone := os.Getenv("PAIR_PHONE"); phone != "" {
+				code, perr := client.PairPhone(context.Background(), phone, true, whatsmeow.PairClientChrome, "Chrome (macOS)")
+				if perr != nil {
+					logger.Errorf("PairPhone failed: %v", perr)
+				} else {
+					fmt.Println("PAIRCODE:" + code)
+					fmt.Println("Phone: Linked devices → Link a device → 'Link with phone number instead' → type the code")
+				}
 			}
 
 			// Print QR code for pairing with phone
