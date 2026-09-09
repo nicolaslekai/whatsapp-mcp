@@ -2341,6 +2341,44 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "jid": info.JID.String(), "name": name})
 	}))
 
+	// Kimi Jimmy: rename a group — a project rename on the Mac has to carry the
+	// bound group's subject along, otherwise config.waGroups and the phone drift apart.
+	mux.HandleFunc("/api/rename-group", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			JID  string `json:"jid"`
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.JID) == "" {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+		jid, err := types.ParseJID(strings.TrimSpace(req.JID))
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil || jid.Server != types.GroupServer {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "not a group jid"})
+			return
+		}
+		name := strings.TrimSpace(req.Name)
+		if len(name) > 25 {
+			name = name[:25]
+		}
+		if err := client.SetGroupName(r.Context(), jid, name); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+		// keep the local chats table in step so list_chats shows the new name before the next sync event
+		if messageStore != nil && messageStore.db != nil {
+			_, _ = messageStore.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, jid.String())
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "jid": jid.String(), "name": name})
+	}))
+
 	// Kimi Jimmy: invite link for a group (for adding collaborators).
 	mux.HandleFunc("/api/invite-link", auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
